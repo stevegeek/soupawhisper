@@ -121,6 +121,30 @@ poetry run python dictate.py
 - Or tap **F12** to start recording and tap again to transcribe (see `record_mode`)
 - Press **Ctrl+C** to quit (when running manually)
 
+### Tray menu
+
+- **● Start / ■ Stop recording**: same as tapping the hotkey; shows elapsed time while recording.
+  Middle-click the tray icon does the same. While recording the icon is shown as needing
+  attention, so it stays visible even if tray icons are collapsed.
+- **Engine · device**: switch between Whisper and Granite on CPU or GPU without restarting.
+  The previous model is unloaded first (freeing GPU memory for other apps, e.g. a local LLM).
+  If a GPU engine can't load (say the GPU is full), SoupaWhisper falls back to Whisper · CPU.
+  The choice is remembered in `~/.config/soupawhisper/state.ini`.
+
+### Granite engine (optional)
+
+[IBM Granite Speech 4.1 2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) is an
+English-focused speech model with punctuation and **keyword biasing**: list the names, acronyms
+and jargon you use under `[granite] keywords` and it will favour them. It needs ~5 GB of GPU
+memory; on CPU it works but is several times slower than Whisper.
+
+```bash
+.venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+.venv/bin/pip install -r requirements-granite.txt
+```
+
+The model (~5 GB) downloads the first time Granite is selected.
+
 ## Run as a systemd Service
 
 Use the service control script to manage SoupaWhisper as a background service:

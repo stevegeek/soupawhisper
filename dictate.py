@@ -15,6 +15,7 @@ import time
 import signal
 import sys
 import os
+import queue
 import select
 from enum import Enum
 from pathlib import Path
@@ -81,8 +82,11 @@ def preload_cuda_libs():
 preload_cuda_libs()
 
 import evdev
+import numpy as np
 from evdev import ecodes
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
+from faster_whisper.vad import VadOptions, get_speech_timestamps
 
 __version__ = "0.3.0"
 
@@ -92,6 +96,7 @@ TRAY_ICONS = {
     "recording": "media-record",
     "processing": "system-run",
     "loading": "content-loading-symbolic",
+    "error": "dialog-error",
 }
 
 # Load configuration
@@ -132,6 +137,9 @@ def load_config():
         # faster-whisper's own VAD defaults
         "vad_threshold": 0.5,
         "vad_min_speech_ms": 0,
+        "engine": "whisper",
+        "granite_model": "ibm-granite/granite-speech-4.1-2b",
+        "granite_keywords": "",
     }
 
     if CONFIG_PATH.exists():
@@ -140,9 +148,14 @@ def load_config():
     else:
         log.debug(f"Config file not found, using defaults: {CONFIG_PATH}")
 
+    whisper_device = config.get("whisper", "device", fallback=defaults["device"])
+    # The engine picked from the tray menu is saved here and wins over config.ini
+    state = configparser.ConfigParser()
+    state.read(STATE_PATH)
+
     cfg = {
         "model": config.get("whisper", "model", fallback=defaults["model"]),
-        "device": config.get("whisper", "device", fallback=defaults["device"]),
+        "device": whisper_device,
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
@@ -154,17 +167,36 @@ def load_config():
         "record_mode": config.get("behavior", "record_mode", fallback=defaults["record_mode"]).strip().lower(),
         "vad_threshold": config.getfloat("vad", "threshold", fallback=defaults["vad_threshold"]),
         "vad_min_speech_ms": config.getint("vad", "min_speech_ms", fallback=defaults["vad_min_speech_ms"]),
+        "engine": state.get("engine", "engine", fallback=config.get("engine", "engine", fallback=defaults["engine"])).strip().lower(),
+        "engine_device": state.get("engine", "device", fallback=config.get("engine", "device", fallback=whisper_device)).strip().lower(),
+        "granite_model": config.get("granite", "model", fallback=defaults["granite_model"]),
+        "granite_keywords": [k.strip() for k in config.get("granite", "keywords", fallback=defaults["granite_keywords"]).split(",") if k.strip()],
     }
     if cfg["record_mode"] not in RECORD_MODES:
         log.warning(f"Unknown record_mode: {cfg['record_mode']}, expected one of {', '.join(RECORD_MODES)}; using auto")
         cfg["record_mode"] = "auto"
-    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, record_mode={cfg['record_mode']}, long_press={cfg['long_press']}, vad_threshold={cfg['vad_threshold']}, vad_min_speech_ms={cfg['vad_min_speech_ms']}")
+    if cfg["engine"] not in ENGINE_NAMES or cfg["engine_device"] not in DEVICE_NAMES:
+        log.warning(f"Unknown engine/device: {cfg['engine']}/{cfg['engine_device']}; using whisper/cpu")
+        cfg["engine"], cfg["engine_device"] = "whisper", "cpu"
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, record_mode={cfg['record_mode']}, long_press={cfg['long_press']}, vad_threshold={cfg['vad_threshold']}, vad_min_speech_ms={cfg['vad_min_speech_ms']}, engine={cfg['engine']}, engine_device={cfg['engine_device']}, granite_model={cfg['granite_model']}, granite_keywords={len(cfg['granite_keywords'])}")
     return cfg
+
+
+def save_engine_choice(engine, device):
+    """Remember the engine picked from the tray across restarts."""
+    state = configparser.ConfigParser()
+    state["engine"] = {"engine": engine, "device": device}
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(STATE_PATH, "w") as f:
+        state.write(f)
 
 
 # hold: record while held; toggle: tap to start, tap to stop;
 # auto: a tap shorter than long_press toggles, a longer hold records while held
 RECORD_MODES = ("auto", "hold", "toggle")
+ENGINE_NAMES = {"whisper": "Whisper", "granite": "Granite"}
+DEVICE_NAMES = {"cpu": "CPU", "cuda": "GPU"}
+STATE_PATH = CONFIG_PATH.parent / "state.ini"
 
 CONFIG = load_config()
 
@@ -194,6 +226,8 @@ VAD_PARAMETERS = {
     "threshold": CONFIG["vad_threshold"],
     "min_speech_duration_ms": CONFIG["vad_min_speech_ms"],
 }
+GRANITE_MODEL = CONFIG["granite_model"]
+GRANITE_KEYWORDS = CONFIG["granite_keywords"]
 
 
 class State(Enum):
@@ -326,16 +360,140 @@ def find_keyboard_devices(paths=None):
     return devices
 
 
+class WhisperEngine:
+    """faster-whisper; runs well on CPU."""
+
+    def __init__(self, device):
+        # compute_type from config applies to the configured device; otherwise pick per device
+        compute_type = COMPUTE_TYPE if device == DEVICE else ("float16" if device == "cuda" else "int8")
+        log.info(f"Loading Whisper model ({MODEL_SIZE}) on {device} with {compute_type}...")
+        self.model = WhisperModel(MODEL_SIZE, device=device, compute_type=compute_type)
+
+    def transcribe(self, path):
+        # Determine language for transcription
+        use_language = LANGUAGE
+        if ALLOWED_LANGUAGES and not LANGUAGE:
+            # First pass: detect language
+            _, detect_info = self.model.transcribe(path, beam_size=1, vad_filter=True)
+            detected = detect_info.language
+            log.debug(f"Detected language: {detected}")
+            if detected not in ALLOWED_LANGUAGES:
+                log.info(f"Detected '{detected}' not in allowed {ALLOWED_LANGUAGES}, using '{ALLOWED_LANGUAGES[0]}'")
+                use_language = ALLOWED_LANGUAGES[0]
+            else:
+                use_language = detected
+
+        segments, info = self.model.transcribe(
+            path,
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=VAD_PARAMETERS,
+            language=use_language,
+            # Whisper invents filler ("yeah", "bye bye bye") over silence and noise.
+            # Don't let one window's hallucination prime the next into a loop, and
+            # skip silent gaps once a hallucination is detected around them.
+            condition_on_previous_text=False,
+            word_timestamps=True,
+            hallucination_silence_threshold=2,
+        )
+        return " ".join(segment.text.strip() for segment in segments)
+
+    def close(self):
+        del self.model
+
+
+class GraniteEngine:
+    """IBM Granite Speech (English-focused, keyword biasing); best on GPU."""
+
+    SAMPLE_RATE = 16000
+    MAX_CHUNK_S = 30  # the card documents no long-form support, so feed it VAD-split chunks
+
+    def __init__(self, device):
+        # Heavy imports only when Granite is actually used
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+        self.torch = torch
+        self.device = device
+        # bf16 on CPU is ~2.5x faster than fp32 on AVX-512 BF16 CPUs (Zen 4/5)
+        dtype = torch.bfloat16
+        log.info(f"Loading Granite model ({GRANITE_MODEL}) on {device} with bfloat16...")
+        self.processor = AutoProcessor.from_pretrained(GRANITE_MODEL)
+        self.tokenizer = self.processor.tokenizer
+        self.model = AutoModelForSpeechSeq2Seq.from_pretrained(GRANITE_MODEL, dtype=dtype).to(device).eval()
+
+        instruction = "transcribe the speech with proper punctuation and capitalization."
+        if GRANITE_KEYWORDS:
+            instruction += " Keywords: " + ", ".join(GRANITE_KEYWORDS)
+        self.prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "<|audio|>" + instruction}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        # The first generate() is several times slower (kernel warm-up); pay it now
+        self._generate(np.zeros(self.SAMPLE_RATE, dtype=np.float32))
+
+    def _generate(self, audio):
+        wav = self.torch.from_numpy(audio).unsqueeze(0)
+        inputs = self.processor(self.prompt, wav, device=self.device, return_tensors="pt").to(self.device)
+        with self.torch.inference_mode():
+            out = self.model.generate(**inputs, max_new_tokens=300, do_sample=False, num_beams=1)
+        return self.tokenizer.batch_decode(
+            out[:, inputs["input_ids"].shape[-1]:], skip_special_tokens=True
+        )[0].strip()
+
+    def _speech_chunks(self, audio):
+        """Drop silence and group the remaining speech into chunks of at most MAX_CHUNK_S."""
+        options = VadOptions(**VAD_PARAMETERS, max_speech_duration_s=self.MAX_CHUNK_S)
+        max_len = self.MAX_CHUNK_S * self.SAMPLE_RATE
+        gap = np.zeros(int(0.2 * self.SAMPLE_RATE), dtype=np.float32)  # keep words apart
+        chunks, current = [], []
+        for ts in get_speech_timestamps(audio, options):
+            piece = audio[ts["start"]:ts["end"]]
+            if current and sum(len(p) for p in current) + len(gap) + len(piece) > max_len:
+                chunks.append(np.concatenate(current))
+                current = []
+            current += [gap, piece] if current else [piece]
+        if current:
+            chunks.append(np.concatenate(current))
+        return chunks
+
+    def transcribe(self, path):
+        audio = decode_audio(path, sampling_rate=self.SAMPLE_RATE)
+        chunks = self._speech_chunks(audio)
+        log.debug(f"Granite: {len(chunks)} speech chunk(s), {sum(len(c) for c in chunks) / self.SAMPLE_RATE:.1f}s of speech")
+        return " ".join(t for t in (self._generate(c) for c in chunks) if t)
+
+    def close(self):
+        del self.model
+        import gc
+        gc.collect()
+        if self.device == "cuda":
+            self.torch.cuda.empty_cache()  # give the VRAM back (e.g. to LM Studio)
+
+
+ENGINES = {"whisper": WhisperEngine, "granite": GraniteEngine}
+
+
+def engine_label(engine, device):
+    return f"{ENGINE_NAMES[engine]} · {DEVICE_NAMES[device]}"
+
+
 class Dictation:
     def __init__(self):
         log.debug("Initializing Dictation instance")
         self.recording = False
         self.record_process = None
         self.temp_file = None
-        self.model = None
+        self.record_started_at = 0.0
+        self.engine = None
+        self.engine_name = CONFIG["engine"]
+        self.engine_device = CONFIG["engine_device"]
+        self.pending_engine = None  # (engine, device) to switch to once idle
         self.model_loaded = threading.Event()
         self.model_error = None
         self.running = True
+        # Tray actions run on the GTK thread; hand them to the event loop thread
+        self.requests = queue.SimpleQueue()
         # Toggle vs. hold-to-record state
         self.state = State.IDLE
         self.key_down = False
@@ -344,14 +502,13 @@ class Dictation:
         self.notification_id = 0  # For replacing notifications
         self.target_window_class = None  # Window to paste into
 
-        # Load model in background
-        log.info(f"Loading Whisper model ({MODEL_SIZE}) on {DEVICE} with {COMPUTE_TYPE}...")
-        threading.Thread(target=self._load_model, daemon=True).start()
-
         # System tray icon
         self.indicator = None
         if HAS_TRAY:
             self._setup_tray()
+
+        # Load model in background
+        threading.Thread(target=self._load_engine, args=(self.engine_name, self.engine_device), daemon=True).start()
 
     def _setup_tray(self):
         """Set up the system tray icon with menu using GTK AppIndicator."""
@@ -369,16 +526,40 @@ class Dictation:
         # Create menu
         menu = Gtk.Menu()
 
-        # Header items (non-clickable info)
-        item_version = Gtk.MenuItem(label=f"SoupaWhisper v{__version__}")
-        item_version.set_sensitive(False)
-        menu.append(item_version)
+        # Start/stop button; also what a middle click on the tray icon does
+        self.item_record = Gtk.MenuItem(label="● Start recording")
+        self.item_record.connect("activate", lambda _: self.requests.put(("toggle_recording",)))
+        menu.append(self.item_record)
+        self.indicator.set_secondary_activate_target(self.item_record)
 
-        item_hotkey = Gtk.MenuItem(label=f"Hotkey: {HOTKEY_NAME}")
-        item_hotkey.set_sensitive(False)
-        menu.append(item_hotkey)
+        self.item_status = Gtk.MenuItem(label="Loading...")
+        self.item_status.set_sensitive(False)
+        menu.append(self.item_status)
 
         menu.append(Gtk.SeparatorMenuItem())
+
+        # Engine · device choices
+        self.engine_items = {}
+        group = None
+        for engine in ENGINE_NAMES:
+            for device in DEVICE_NAMES:
+                label = engine_label(engine, device)
+                if (engine, device) == ("granite", "cpu"):
+                    label += " (slow)"
+                item = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+                group = item
+                item.set_active((engine, device) == (self.engine_name, self.engine_device))
+                item.connect("toggled", self._on_engine_toggled, engine, device)
+                menu.append(item)
+                self.engine_items[(engine, device)] = item
+        self._syncing_engine_items = False
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Header items (non-clickable info)
+        item_version = Gtk.MenuItem(label=f"SoupaWhisper v{__version__} · Hotkey: {HOTKEY_NAME}")
+        item_version.set_sensitive(False)
+        menu.append(item_version)
 
         # Open Config
         item_config = Gtk.MenuItem(label="Open Config")
@@ -423,37 +604,125 @@ class Dictation:
         GLib.idle_add(Gtk.main_quit)
         self.stop()
 
-    def _update_tray(self, state):
-        """Update tray icon based on state: 'ready', 'recording', 'processing'."""
-        if not hasattr(self, 'indicator') or not self.indicator:
-            return
-        icon = TRAY_ICONS.get(state, TRAY_ICONS["loading"])
-        titles = {
-            "ready": f"SoupaWhisper - Ready ({HOTKEY_NAME})",
-            "recording": "SoupaWhisper - Recording...",
-            "processing": "SoupaWhisper - Processing...",
-        }
-        # Use GLib.idle_add to update from main thread
-        GLib.idle_add(self.indicator.set_icon, icon)
-        GLib.idle_add(self.indicator.set_title, titles.get(state, "SoupaWhisper"))
+    def _on_engine_toggled(self, item, engine, device):
+        if item.get_active() and not self._syncing_engine_items:
+            self.requests.put(("switch_engine", engine, device))
 
-    def _load_model(self):
-        log.debug("Model loading thread started")
+    def _update_tray(self, state):
+        """Update tray icon and menu: 'loading', 'ready', 'recording', 'processing', 'error'."""
+        if not getattr(self, "indicator", None):
+            return
+        GLib.idle_add(self._apply_tray_state, state)
+
+    def _apply_tray_state(self, state):
+        """Runs on the GTK thread."""
+        engine = engine_label(self.engine_name, self.engine_device)
+        titles = {
+            "loading": f"SoupaWhisper - Loading {engine}...",
+            "ready": f"SoupaWhisper - Ready ({HOTKEY_NAME}) · {engine}",
+            "recording": "SoupaWhisper - Recording...",
+            "processing": f"SoupaWhisper - Transcribing with {engine}...",
+            "error": "SoupaWhisper - Model failed to load",
+        }
+        statuses = {
+            "loading": f"Loading {engine}...",
+            "ready": f"Ready · {engine}",
+            "recording": f"Recording · {engine}",
+            "processing": f"Transcribing with {engine}...",
+            "error": "Model failed to load",
+        }
+        self.indicator.set_icon_full(TRAY_ICONS.get(state, TRAY_ICONS["loading"]), titles.get(state, "SoupaWhisper"))
+        self.indicator.set_title(titles.get(state, "SoupaWhisper"))
+        self.item_status.set_label(statuses.get(state, ""))
+
+        if state == "recording":
+            # NeedsAttention: KDE shows the icon even if tray icons are hidden in the overflow
+            self.indicator.set_attention_icon_full(TRAY_ICONS["recording"], "Recording")
+            self.indicator.set_status(AppIndicator3.IndicatorStatus.ATTENTION)
+            self._tick_record_label()
+            GLib.timeout_add_seconds(1, self._tick_record_label)
+        else:
+            self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+            self.item_record.set_label("● Start recording")
+        self.item_record.set_sensitive(state in ("ready", "recording"))
+
+        # Reflect the engine actually loaded (e.g. after falling back to Whisper · CPU)
+        self._syncing_engine_items = True
+        self.engine_items[(self.engine_name, self.engine_device)].set_active(True)
+        self._syncing_engine_items = False
+        return False  # one-shot idle callback
+
+    def _tick_record_label(self):
+        if not self.recording:
+            return False  # stops the timer
+        elapsed = int(time.time() - self.record_started_at)
+        self.item_record.set_label(f"■ Stop recording ({elapsed // 60}:{elapsed % 60:02d})")
+        return True
+
+    def _load_engine(self, engine, device):
+        log.debug(f"Model loading thread started ({engine_label(engine, device)})")
+        self._update_tray("loading")
         try:
-            import time
             start_time = time.time()
-            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+            self.engine = ENGINES[engine](device)
+            self.engine_name, self.engine_device = engine, device
+            self.model_error = None
             elapsed = time.time() - start_time
             self.model_loaded.set()
-            log.info(f"Model loaded successfully in {elapsed:.1f}s - Ready for dictation!")
-            log.info(f"Hold [{HOTKEY_NAME}] to record, release to transcribe")
+            log.info(f"Model loaded successfully in {elapsed:.1f}s - Ready for dictation! ({engine_label(engine, device)})")
             self._update_tray("ready")
         except Exception as e:
+            log.error(f"Failed to load {engine_label(engine, device)}: {e}")
+            if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
+                log.error("Hint: the GPU may be busy (e.g. an LLM is loaded); switch to a CPU engine from the tray.")
+            if (engine, device) != ("whisper", "cpu"):
+                # e.g. GPU out of memory: keep dictation working on Whisper · CPU
+                self.notify(f"Couldn't load {engine_label(engine, device)}",
+                            f"{str(e)[:80]}\nFalling back to Whisper · CPU", "dialog-warning", 6000)
+                self._load_engine("whisper", "cpu")
+                return
             self.model_error = str(e)
             self.model_loaded.set()
-            log.error(f"Failed to load model: {e}")
-            if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
-                log.error("Hint: Try setting device = cpu in your config, or install cuDNN.")
+            self._update_tray("error")
+
+    def switch_engine(self, engine, device):
+        """Swap the transcription engine; call only from the event loop thread while idle."""
+        if (engine, device) == (self.engine_name, self.engine_device) and self.engine:
+            return
+        log.info(f"Switching engine to {engine_label(engine, device)}")
+        save_engine_choice(engine, device)
+        self.model_loaded.clear()
+        if self.engine:
+            self.engine.close()  # free RAM/VRAM before loading the next one
+            self.engine = None
+        threading.Thread(target=self._load_engine, args=(engine, device), daemon=True).start()
+
+    def toggle_recording_from_tray(self):
+        """Start/stop button in the tray menu: behaves like the toggle-mode hotkey."""
+        if self.recording:
+            self.state = State.IDLE
+            self.stop_recording()
+        else:
+            self.start_recording()
+            if self.recording:
+                self.state = State.TOGGLED  # the hotkey can stop it too
+
+    def handle_requests(self):
+        """Run tray actions queued from the GTK thread."""
+        while True:
+            try:
+                action, *args = self.requests.get_nowait()
+            except queue.Empty:
+                break
+            if action == "toggle_recording":
+                self.toggle_recording_from_tray()
+            elif action == "switch_engine":
+                self.pending_engine = tuple(args)
+        # Never swap the model under an active recording
+        if self.pending_engine and not self.recording:
+            engine, device = self.pending_engine
+            self.pending_engine = None
+            self.switch_engine(engine, device)
 
     def close_notification(self):
         """Close the most recent notification, if any."""
@@ -521,6 +790,7 @@ class Dictation:
             return
 
         self.recording = True
+        self.record_started_at = time.time()
         self._update_tray("recording")
         self.temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         self.temp_file.close()
@@ -575,50 +845,23 @@ class Dictation:
         if self.model_error:
             log.error(f"Cannot transcribe: model failed to load")
             self.notify("Error", "Model failed to load", "dialog-error", 3000)
+            if self.temp_file and os.path.exists(self.temp_file.name):
+                os.unlink(self.temp_file.name)
+            self._update_tray("error")
             return
 
         # Transcribe
         try:
-            import time
             start_time = time.time()
-            log.debug(f"Starting transcription of {self.temp_file.name}")
+            log.debug(f"Starting transcription of {self.temp_file.name} with {engine_label(self.engine_name, self.engine_device)}")
 
             # Check file size
             file_size = os.path.getsize(self.temp_file.name)
             log.debug(f"Audio file size: {file_size} bytes")
 
-            # Determine language for transcription
-            use_language = LANGUAGE
-            if ALLOWED_LANGUAGES and not LANGUAGE:
-                # First pass: detect language
-                _, detect_info = self.model.transcribe(
-                    self.temp_file.name, beam_size=1, vad_filter=True
-                )
-                detected = detect_info.language
-                log.debug(f"Detected language: {detected}")
-                if detected not in ALLOWED_LANGUAGES:
-                    log.info(f"Detected '{detected}' not in allowed {ALLOWED_LANGUAGES}, using '{ALLOWED_LANGUAGES[0]}'")
-                    use_language = ALLOWED_LANGUAGES[0]
-                else:
-                    use_language = detected
-
-            segments, info = self.model.transcribe(
-                self.temp_file.name,
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters=VAD_PARAMETERS,
-                language=use_language,
-                # Whisper invents filler ("yeah", "bye bye bye") over silence and noise.
-                # Don't let one window's hallucination prime the next into a loop, and
-                # skip silent gaps once a hallucination is detected around them.
-                condition_on_previous_text=False,
-                word_timestamps=True,
-                hallucination_silence_threshold=2,
-            )
-
-            text = " ".join(segment.text.strip() for segment in segments)
+            text = self.engine.transcribe(self.temp_file.name)
             elapsed = time.time() - start_time
-            log.debug(f"Transcription completed in {elapsed:.2f}s")
+            log.info(f"Transcription completed in {elapsed:.2f}s ({engine_label(self.engine_name, self.engine_device)})")
 
             if text:
                 log.info(f"Transcribed ({len(text)} chars): {text[:80]}{'...' if len(text) > 80 else ''}")
@@ -728,6 +971,8 @@ class Dictation:
         log.debug(f"Event loop starting, waiting for {HOTKEY_NAME} key events...")
 
         while self.running:
+            self.handle_requests()
+
             if time.monotonic() - last_scan >= 1.0:
                 last_scan = time.monotonic()
                 current_paths = set(evdev.list_devices())
