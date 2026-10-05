@@ -129,6 +129,9 @@ def load_config():
         "language": "auto",
         "long_press": 0.4,
         "record_mode": "auto",
+        # faster-whisper's own VAD defaults
+        "vad_threshold": 0.5,
+        "vad_min_speech_ms": 0,
     }
 
     if CONFIG_PATH.exists():
@@ -149,11 +152,13 @@ def load_config():
         "language": config.get("whisper", "language", fallback=defaults["language"]),
         "long_press": config.getfloat("behavior", "long_press", fallback=defaults["long_press"]),
         "record_mode": config.get("behavior", "record_mode", fallback=defaults["record_mode"]).strip().lower(),
+        "vad_threshold": config.getfloat("vad", "threshold", fallback=defaults["vad_threshold"]),
+        "vad_min_speech_ms": config.getint("vad", "min_speech_ms", fallback=defaults["vad_min_speech_ms"]),
     }
     if cfg["record_mode"] not in RECORD_MODES:
         log.warning(f"Unknown record_mode: {cfg['record_mode']}, expected one of {', '.join(RECORD_MODES)}; using auto")
         cfg["record_mode"] = "auto"
-    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, record_mode={cfg['record_mode']}, long_press={cfg['long_press']}")
+    log.debug(f"Config loaded: model={cfg['model']}, device={cfg['device']}, compute_type={cfg['compute_type']}, language={cfg['language']}, key={cfg['key']}, auto_type={cfg['auto_type']}, notifications={cfg['notifications']}, audio_device={cfg['audio_device']}, paste_keys={cfg['paste_keys']}, record_mode={cfg['record_mode']}, long_press={cfg['long_press']}, vad_threshold={cfg['vad_threshold']}, vad_min_speech_ms={cfg['vad_min_speech_ms']}")
     return cfg
 
 
@@ -185,6 +190,10 @@ NOTIFICATIONS = CONFIG["notifications"]
 AUDIO_DEVICE = CONFIG["audio_device"]
 LONG_PRESS = CONFIG["long_press"]
 RECORD_MODE = CONFIG["record_mode"]
+VAD_PARAMETERS = {
+    "threshold": CONFIG["vad_threshold"],
+    "min_speech_duration_ms": CONFIG["vad_min_speech_ms"],
+}
 
 
 class State(Enum):
@@ -597,7 +606,14 @@ class Dictation:
                 self.temp_file.name,
                 beam_size=5,
                 vad_filter=True,
+                vad_parameters=VAD_PARAMETERS,
                 language=use_language,
+                # Whisper invents filler ("yeah", "bye bye bye") over silence and noise.
+                # Don't let one window's hallucination prime the next into a loop, and
+                # skip silent gaps once a hallucination is detected around them.
+                condition_on_previous_text=False,
+                word_timestamps=True,
+                hallucination_silence_threshold=2,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
