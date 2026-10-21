@@ -1,0 +1,5 @@
+[env]
+# Build transcribe.cpp for this machine's CPU and GPU only (much faster CUDA build), with
+# its bundled CPU math: Arch's netlib libblas lacks the cblas symbols system BLAS needs.
+TRANSCRIBE_CMAKE_ARGS = "-DGGML_NATIVE=ON -DCMAKE_CUDA_ARCHITECTURES=native -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc -DTRANSCRIBE_USE_SYSTEM_BLAS=OFF"
+CUDA_PATH = "/opt/cuda"
