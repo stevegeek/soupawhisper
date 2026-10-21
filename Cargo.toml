@@ -5,7 +5,7 @@ edition = "2024"
 authors = ["Kyle Redelinghuys <kyle@ksred.com>", "Stephen Ierodiaconou <stevegeek@gmail.com>"]
 license = "MIT"
 description = "Push-to-talk voice dictation for Linux with Whisper and Granite Speech on transcribe.cpp"
-repository = "https://github.com/stevegeek/soupawhisper-wayland"
+repository = "https://github.com/stevegeek/soupawhisper"
 readme = "README.md"
 build = "build.rs"
 

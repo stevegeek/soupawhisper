@@ -40,7 +40,7 @@ sudo usermod -aG input $USER    # then log out and back in
 ## Install
 
 ```bash
-git clone https://github.com/stevegeek/soupawhisper-wayland.git soupawhisper
+git clone https://github.com/stevegeek/soupawhisper.git
 cd soupawhisper
 ./install.sh            # CUDA build; or --vulkan, or --cpu
 systemctl --user enable --now soupawhisper
@@ -122,7 +122,7 @@ Granite Speech running on PyTorch.
 
 In October 2026 it was ported to Rust on transcribe.cpp, which runs both Whisper and Granite on
 ggml, so neither engine needs Python or PyTorch any more. The last Python version is at commit
-[`0cbb8b6`](https://github.com/stevegeek/soupawhisper-wayland/tree/0cbb8b6) if you need it.
+[`0cbb8b6`](https://github.com/stevegeek/soupawhisper/tree/0cbb8b6) if you need it.
 
 Measured on one machine (Ryzen 9 9950X, RTX 5070 Ti) with the same 5-12 s clips and settings,
 Python's faster-whisper with int8 and Granite in bf16 against the Rust build's Q8_0 GGUFs:
