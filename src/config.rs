@@ -1,5 +1,5 @@
-//! `~/.config/soupawhisper/config.ini`, shared with the Python version, plus `state.ini`
-//! where the device picked from the tray is remembered.
+//! `~/.config/soupawhisper/config.ini`, plus `state.ini` where the engine picked from the
+//! tray is remembered.
 
 use std::collections::HashMap;
 use std::fs;
@@ -76,7 +76,7 @@ impl Device {
         }
     }
 
-    /// Python's config/state spell the GPU as "cuda".
+    /// The config and state spell the GPU as "cuda".
     fn parse(s: &str) -> Option<Device> {
         match s.trim().to_lowercase().as_str() {
             "cpu" => Some(Device::Cpu),
@@ -146,7 +146,7 @@ pub struct Config {
     pub choice: Choice,
 }
 
-/// A minimal reader for the configparser-style INI files the Python version writes.
+/// A minimal reader for configparser-style INI files.
 pub fn parse_ini(text: &str) -> HashMap<(String, String), String> {
     let mut out = HashMap::new();
     let mut section = String::new();
@@ -228,7 +228,7 @@ impl Config {
             }
         };
 
-        // The tray choice in state.ini wins over config.ini, as in the Python version
+        // The tray choice in state.ini wins over config.ini
         let configured = ini.str("whisper", "device", "cpu");
         let engine_str = state
             .get("engine", "engine")
@@ -246,7 +246,8 @@ impl Config {
             }
         };
 
-        let keywords = ini.str("granite", "keywords", "");
+        // [granite] keywords is where they lived when only Granite used them
+        let keywords = ini.get("engine", "keywords").or(ini.get("granite", "keywords")).unwrap_or("").to_string();
         let keywords = keywords.split(',').map(str::trim).filter(|k| !k.is_empty()).map(str::to_string).collect();
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -358,7 +359,6 @@ mod tests {
     fn paste_keys_press_then_release_in_reverse() {
         assert_eq!(parse_paste_keys("cmd+v"), ["125:1", "47:1", "47:0", "125:0"]);
         assert_eq!(parse_paste_keys("ctrl+shift+v"), ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]);
-        // The Python table had s = 31 twice; b is 48
         assert_eq!(parse_paste_keys("ctrl+b"), ["29:1", "48:1", "48:0", "29:0"]);
         assert_eq!(parse_paste_keys("bogus"), ["29:1", "47:1", "47:0", "29:0"]);
     }
@@ -377,7 +377,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_python_config_and_state() {
+    fn engine_keywords_win_over_granite_keywords() {
+        let dir = std::env::temp_dir().join(format!("soupawhisper-kw-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        fs::write(&path, "[engine]\nkeywords = Ruby, Hotwire\n[granite]\nkeywords = Rails\n").unwrap();
+        assert_eq!(Config::load(&path).keywords, ["Ruby", "Hotwire"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reads_config_and_state() {
         let dir = std::env::temp_dir().join(format!("soupawhisper-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.ini");

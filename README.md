@@ -1,325 +1,145 @@
 # SoupaWhisper
 
-A simple push-to-talk voice dictation tool for Linux using faster-whisper. Hold a key to record, release to transcribe, and it automatically copies to clipboard and types into the active input.
+Push-to-talk voice dictation for Linux. Press a key, speak, and the text is typed into whatever
+window has focus.
 
-Supports both **X11** and **Wayland** (including KDE Plasma).
+SoupaWhisper runs speech recognition locally with **Whisper** or **IBM Granite Speech**, on the GPU
+(CUDA or Vulkan) or the CPU, through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp).
+It is a single Rust binary: models load in about a second and nothing leaves your machine.
 
-**Features:**
-- Push-to-talk recording with configurable hotkey (F1-F24)
-- Auto-paste into active window after transcription
-- System tray icon with status indicator (gray=loading, green=ready, red=recording)
-- Configurable audio device, language detection, and paste keys
-- Desktop notifications
+**Features**
+
+- Push-to-talk on a configurable hotkey (F1-F24, Scroll Lock, Pause, ...): hold to record, tap to
+  toggle, or `auto` (a tap toggles, a long press holds)
+- Types the text into the focused window and copies it to the clipboard
+- Two engines, switchable from the tray: Whisper (99 languages) and Granite Speech (English-focused,
+  very accurate), each on GPU or CPU, falling back to Whisper · CPU if the GPU can't load
+- Keyword biasing for names and jargon (`Sidekiq`, `PostgreSQL`, your product names...)
+- Silero voice activity detection, so silence and noise don't turn into invented words
+- Language limits: auto-detect only among the languages you speak
+- Tray icon with status, a start/stop button with a timer, and the engine menu
+- Wayland (KDE Plasma, GNOME, wlroots) and X11; keyboards that come and go (virtual keyboards,
+  Bluetooth, RustDesk) are picked up automatically
 
 ## Requirements
 
-- Python 3.10+
-- Poetry
-- Linux with X11 or Wayland (ALSA audio)
+- Linux with ALSA (`arecord`)
+- Wayland: `wl-clipboard` and `ydotool` (with `ydotoold` running); X11: `xclip` and `xdotool`
+- Read access to `/dev/input/event*`: add yourself to the `input` group
+- To build: Rust (stable), CMake and a C++ compiler; for GPU support the CUDA toolkit or the
+  Vulkan SDK
 
-## Supported Distros
-
-- Ubuntu / Pop!_OS / Debian (apt)
-- Fedora (dnf)
-- Arch Linux (pacman)
-- openSUSE (zypper)
-
-## Supported Desktop Environments
-
-- GNOME (X11/Wayland)
-- KDE Plasma (X11/Wayland)
-- Sway, Hyprland, and other wlroots-based compositors
-- Any X11-based desktop
-
-## Installation
+On Arch:
 
 ```bash
-git clone https://github.com/ksred/soupawhisper.git
-cd soupawhisper
-chmod +x install.sh
-./install.sh
-```
-
-The installer will:
-1. Detect your package manager
-2. Install system dependencies
-3. Install Python dependencies via Poetry
-4. Set up the config file
-5. Optionally install as a systemd service
-
-### Manual Installation
-
-#### X11
-
-```bash
-# Ubuntu/Debian
-sudo apt install alsa-utils xclip xdotool libnotify-bin
-
-# Fedora
-sudo dnf install alsa-utils xclip xdotool libnotify
-
-# Arch
-sudo pacman -S alsa-utils xclip xdotool libnotify
-
-# Then install Python deps
-poetry install
-```
-
-#### Wayland (KDE, GNOME, Sway, etc.)
-
-```bash
-# Arch
-sudo pacman -S alsa-utils wl-clipboard ydotool libnotify
-
-# Enable ydotool daemon (required for auto-typing)
+sudo pacman -S rust cmake alsa-utils wl-clipboard ydotool   # plus cuda, or vulkan-devel shaderc
 systemctl --user enable --now ydotool
-
-# Add yourself to input group (for keyboard monitoring)
-sudo usermod -aG input $USER
-# Log out and back in for group changes to take effect
-
-# Then install Python deps
-poetry install
+sudo usermod -aG input $USER    # then log out and back in
 ```
 
-### GPU Support (Optional)
-
-For NVIDIA GPU acceleration with CUDA 12:
+## Install
 
 ```bash
-# Ubuntu/Debian
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
-sudo dpkg -i cuda-keyring_1.1-1_all.deb
-sudo apt update
-sudo apt install libcudnn9-cuda-12
+git clone https://github.com/stevegeek/soupawhisper-wayland.git soupawhisper
+cd soupawhisper
+./install.sh            # CUDA build; or --vulkan, or --cpu
+systemctl --user enable --now soupawhisper
 ```
 
-Then edit `~/.config/soupawhisper/config.ini`:
-```ini
-device = cuda
-compute_type = float16 (or float32)
-```
+`install.sh` builds the release binary, installs it to `~/.local/bin/soupawhisper`, writes
+`~/.config/systemd/user/soupawhisper.service`, and creates `~/.config/soupawhisper/config.ini` from
+[`config.example.ini`](config.example.ini) if you don't have one. `./install.sh --uninstall` removes
+the binary and the service and keeps your config and models.
 
-#### CUDA 13 Users
-
-If you have CUDA 13 installed, the bundled cuBLAS/cuDNN won't work with faster-whisper (which expects CUDA 12). Install the CUDA 12 libraries via pip:
-
-```bash
-poetry run pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
-```
-
-The script will automatically detect and use these pip-installed libraries.
+Models are downloaded on first use to `~/.local/share/soupawhisper/models`: GGUF builds from
+[handy-computer on Hugging Face](https://huggingface.co/handy-computer) (Whisper large-v3-turbo is
+0.9 GB at Q8_0, Granite Speech 4.1 2B 2.6 GB) and the 1 MB Silero VAD model.
 
 ## Usage
 
-```bash
-poetry run python dictate.py
-```
+- Press the hotkey (F12 by default) and speak; release it (or tap it again in toggle mode) to
+  transcribe. The text is pasted into the focused window and left on the clipboard.
+- **Tray menu:** start/stop recording (middle-click the icon does the same), the current status,
+  the engine · device choice, Open Config, Restart and Quit. While recording, the icon asks for
+  attention so it stays visible even with tray icons collapsed.
+- **Logs:** `journalctl --user -u soupawhisper -f`
 
-- Hold **F12** to record
-- Release to transcribe → copies to clipboard and types into active input
-- Or tap **F12** to start recording and tap again to transcribe (see `record_mode`)
-- Press **Ctrl+C** to quit (when running manually)
-
-### Tray menu
-
-- **● Start / ■ Stop recording**: same as tapping the hotkey; shows elapsed time while recording.
-  Middle-click the tray icon does the same. While recording the icon is shown as needing
-  attention, so it stays visible even if tray icons are collapsed.
-- **Engine · device**: switch between Whisper and Granite on CPU or GPU without restarting.
-  The previous model is unloaded first (freeing GPU memory for other apps, e.g. a local LLM).
-  If a GPU engine can't load (say the GPU is full), SoupaWhisper falls back to Whisper · CPU.
-  The choice is remembered in `~/.config/soupawhisper/state.ini`.
-
-### Granite engine (optional)
-
-[IBM Granite Speech 4.1 2B](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) is an
-English-focused speech model with punctuation and **keyword biasing**: list the names, acronyms
-and jargon you use under `[granite] keywords` and it will favour them. It needs ~5 GB of GPU
-memory; on CPU it works but is several times slower than Whisper.
+Transcribe a file without the daemon (16 kHz mono 16-bit WAV):
 
 ```bash
-.venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-.venv/bin/pip install -r requirements-granite.txt
-```
-
-The model (~5 GB) downloads the first time Granite is selected.
-
-## Run as a systemd Service
-
-Use the service control script to manage SoupaWhisper as a background service:
-
-```bash
-./service.sh install   # Install and enable the service
-./service.sh start     # Start the service
-./service.sh stop      # Stop the service
-./service.sh restart   # Restart the service
-./service.sh status    # Check service status
-./service.sh logs      # Follow service logs
-./service.sh uninstall # Remove the service
-```
-
-The service will auto-start on login once installed.
-
-Alternatively, the main installer can also set up the service:
-
-```bash
-./install.sh  # Select 'y' when prompted for systemd
+soupawhisper --transcribe clip.wav --engine granite --device gpu
 ```
 
 ## Configuration
 
-Edit `~/.config/soupawhisper/config.ini`:
+`~/.config/soupawhisper/config.ini`; [`config.example.ini`](config.example.ini) documents every
+option. The main ones:
 
-```ini
-[whisper]
-# Model size: tiny.en, base.en, small.en, medium.en, large-v3
-model = base.en
+| Section · key | Meaning |
+|---|---|
+| `[engine] engine`, `device` | `whisper` or `granite`, on `cpu` or `cuda`. The tray choice is saved to `state.ini` and wins over these. |
+| `[engine] keywords` | Comma-separated names and jargon to favour: Granite's keyword list, Whisper's initial prompt. |
+| `[engine] quant` | GGUF quantization to download: `Q8_0` (default), `Q5_K_M`, `F16`, `BF16`. |
+| `[whisper] model` | `large-v3-turbo`, `base.en`, ... or a path to a `.gguf`. |
+| `[whisper] language` | `auto`, a single code (`en`), or a list (`en,it,el`) to detect among. |
+| `[whisper] unload_after` | Minutes of idleness before the model is freed; it reloads while you speak. `0` keeps it loaded. |
+| `[granite] model` | `ibm-granite/granite-speech-4.1-2b` or a path to a `.gguf`. Granite covers en, fr, de, es, pt and ja. |
+| `[hotkey] key` | `f1`-`f24`, `scroll_lock`, `pause`, `insert`, `home`, `end`, `pageup`, `pagedown`. |
+| `[behavior] record_mode` | `hold`, `toggle` or `auto` (with `long_press` seconds). |
+| `[behavior] paste_keys` | Paste shortcut sent by ydotool, e.g. `ctrl+v`, `ctrl+shift+v`, `super+v`. |
+| `[vad] threshold`, `min_speech_ms` | Raise them if breaths or keyboard noise get transcribed. |
 
-# Device: cpu or cuda (cuda requires cuDNN)
-device = cpu
-
-# Compute type: int8 for CPU, float16 (or float32) for GPU
-compute_type = int8
-
-# Language detection:
-#   auto       - Full auto-detect (may detect wrong language)
-#   en         - Force English only
-#   en,it,el   - Auto-detect but limit to these languages (falls back to first if other detected)
-language = en
-
-[hotkey]
-# Key to hold for recording: f1-f20, scroll_lock, pause, insert, home, end, pageup, pagedown
-# Apple keyboards with extended F-keys can use f13-f20
-key = f12
-
-[behavior]
-# Type text into active input field
-auto_type = true
-
-# Show desktop notification
-notifications = true
-
-# Paste shortcut for auto-type (e.g. ctrl+v, super+v, ctrl+shift+v)
-# Note: Terminals typically use ctrl+shift+v, other apps use ctrl+v
-# The app auto-detects terminals (Konsole, Alacritty, etc.) and uses ctrl+shift+v for them
-paste_keys = ctrl+v
-
-# Recording mode:
-#   hold   - hold the key to record, release to transcribe
-#   toggle - tap the key to start recording, tap again to transcribe
-#   auto   - a quick tap toggles, a longer hold records while held
-record_mode = auto
-
-# auto mode only: seconds before entering "hold-to-record" mode, otherwise "toggle" mode
-long_press = 0.4
-
-[audio]
-# Audio device for recording
-#   default      - Use system default (may not work with PipeWire)
-#   plughw:0,0   - Use specific ALSA device directly (bypasses PipeWire)
-# Run 'arecord -l' to list available devices
-device = default
-```
-
-### Context-Aware Paste
-
-The auto-paste feature automatically detects terminal applications (Konsole, Alacritty, Kitty, etc.) and uses `Ctrl+Shift+V` for them, while using the configured `paste_keys` for other applications.
-
-### Direct Audio Device
-
-If you're using PipeWire and your microphone isn't being detected as an input source, you can bypass PipeWire by specifying the ALSA device directly:
+## Development
 
 ```bash
-# List available capture devices
-arecord -l
-
-# Use device from card 0, device 0
-device = plughw:0,0
+cargo test
+cargo build --release                       # CUDA (the default feature)
+cargo build --release --no-default-features # CPU only
 ```
 
-Create the config directory and file if it doesn't exist:
-```bash
-mkdir -p ~/.config/soupawhisper
-cp /path/to/soupawhisper/config.example.ini ~/.config/soupawhisper/config.ini
-```
+`.cargo/config.toml` builds transcribe.cpp for this machine's CPU and GPU only and turns off its
+optional system BLAS (Arch's netlib `libblas` lacks the cblas symbols). `build.rs` links the CUDA
+runtime and cuBLAS, which transcribe-cpp-sys 0.4.0's link manifest leaves out.
 
-## Troubleshooting
+| Module | Does |
+|---|---|
+| `src/app.rs` | The event loop and the hold/toggle hotkey state machine |
+| `src/engine.rs` | Model download and loading, VAD, transcription, language handling |
+| `src/config.rs` | `config.ini` / `state.ini` |
+| `src/hotkey.rs` | evdev keyboard watching, including hot-plugged devices |
+| `src/recorder.rs` | `arecord` capture into memory |
+| `src/output.rs` | Clipboard, auto-paste, notifications |
+| `src/tray.rs` | The StatusNotifierItem tray icon and menu |
 
-**No audio recording:**
-```bash
-# Check your input device
-arecord -l
+## History
 
-# Test recording
-arecord -d 3 test.wav && aplay test.wav
-```
+SoupaWhisper was created by [Kyle Redelinghuys](https://github.com/ksred) as a small Python tool
+built on [faster-whisper](https://github.com/SYSTRAN/faster-whisper):
+[ksred/soupawhisper](https://github.com/ksred/soupawhisper), with contributions from Bhadraksh
+Bhargava and Zachariah Carmichael. This fork, by Stephen Ierodiaconou, added Wayland and KDE Plasma
+support, toggle and auto record modes, hallucination fixes, a tray with engine switching, and IBM
+Granite Speech running on PyTorch.
 
-**PipeWire not detecting microphone:**
+In October 2026 it was ported to Rust on transcribe.cpp, which runs both Whisper and Granite on
+ggml, so neither engine needs Python or PyTorch any more. The last Python version is at commit
+[`0cbb8b6`](https://github.com/stevegeek/soupawhisper-wayland/tree/0cbb8b6) if you need it.
 
-If your microphone shows up in `arecord -l` but not in `pactl list sources`, PipeWire isn't exposing it as an input. Configure the audio device directly in config:
-```ini
-[audio]
-device = plughw:0,0
-```
+Measured on one machine (Ryzen 9 9950X, RTX 5070 Ti) with the same 5-12 s clips and settings,
+Python's faster-whisper with int8 and Granite in bf16 against the Rust build's Q8_0 GGUFs:
 
-**Auto-paste not working:**
+| | Python | Rust |
+|---|---|---|
+| Granite · GPU: model load | 18-21 s | ~1 s |
+| Granite · GPU: per clip | 0.40-0.95 s | 0.25-0.35 s |
+| Granite · GPU: VRAM | 4.9 GB | 3.5 GB |
+| Whisper large-v3-turbo · CPU: per clip | 4.3-4.5 s | 2.8-3.0 s |
+| Whisper large-v3-turbo · GPU: per clip | not measured | 0.13-0.21 s, 1.3 GB VRAM |
+| Process memory (Granite · GPU) | 0.4 GB resident + 1.7 GB swapped, after a week | 0.8 GB resident, mostly the memory-mapped model |
+| Installed size | 7.2 GB virtualenv | 51 MB binary (CUDA build) |
 
-The paste feature uses `ydotool` which injects keyboard events at the evdev level. If you use a key remapper like Toshy/xwaykeyz:
-- ydotool bypasses the remapper, so apps see raw keycodes
-- Configure `paste_keys` to match what apps expect (usually `ctrl+v`)
-- Terminals auto-detect and use `ctrl+shift+v`
+Transcripts matched between the two, except that Whisper now also gets the keyword list, so it
+writes "Sidekiq" and "SparkLoop" where the Python version wrote "sidekick" and "Spark Loop".
 
-**Wrong language detected:**
+## License
 
-With multilingual models (large-v3), Whisper may detect the wrong language. Configure allowed languages:
-```ini
-[whisper]
-language = en,it,el  # Only allow English, Italian, Greek
-```
-
-**Permission issues with keyboard:**
-```bash
-sudo usermod -aG input $USER
-# Then log out and back in
-```
-
-**cuDNN errors with GPU:**
-```
-Unable to load any of {libcudnn_ops.so.9...}
-```
-Install cuDNN 9 (see GPU Support section above) or switch to CPU mode.
-
-## Model Sizes
-
-| Model | Size | Speed | Accuracy |
-|-------|------|-------|----------|
-| tiny.en | ~75MB | Fastest | Basic |
-| base.en | ~150MB | Fast | Good |
-| small.en | ~500MB | Medium | Better |
-| medium.en | ~1.5GB | Slower | Great |
-| large-v3 | ~3GB | Slowest | Best |
-
-For dictation, `base.en` or `small.en` is usually the sweet spot.
-
-## Known Limitations
-
-### Auto-paste only works reliably in terminals
-
-The auto-paste feature uses `ydotool` to send keyboard shortcuts. Currently:
-
-- **Terminals** (Konsole, Alacritty, etc.): Auto-paste works with `Ctrl+Shift+V`
-- **Other apps** (LibreOffice, browsers, etc.): Auto-paste may not work; use manual `Cmd+V` / `Ctrl+V`
-
-The issue is that different apps expect different paste shortcuts:
-- Terminals: `Ctrl+Shift+V`
-- Regular apps: `Ctrl+V`
-- Apps with key remappers (Toshy): More complex
-
-Attempts to auto-detect the active window via KWin D-Bus (`queryWindowInfo`) cause timeouts and UI freezes.
-
-### Outstanding work
-
-- [ ] Find a reliable, non-blocking way to detect the active window class on KDE Wayland
-- [ ] Investigate alternative paste methods (Shift+Insert, menu navigation)
-- [ ] Consider app-specific paste key configuration
+MIT, see [LICENSE](LICENSE). Copyright (c) 2024 Kyle.
