@@ -86,7 +86,9 @@ option. The main ones:
 | `[granite] model` | `ibm-granite/granite-speech-4.1-2b` or a path to a `.gguf`. Granite covers en, fr, de, es, pt and ja. |
 | `[hotkey] key` | `f1`-`f24`, `scroll_lock`, `pause`, `insert`, `home`, `end`, `pageup`, `pagedown`. |
 | `[behavior] record_mode` | `hold`, `toggle` or `auto` (with `long_press` seconds). |
-| `[behavior] paste_keys` | Paste shortcut sent by ydotool, e.g. `ctrl+v`, `ctrl+shift+v`, `super+v`. |
+| `[behavior] paste_keys` | Paste shortcut sent by ydotool, e.g. `ctrl+v`, or `cmd+v` with a Mac-style remapper. |
+| `[behavior] terminal_paste_keys` | Paste shortcut when a terminal has focus (default `ctrl+shift+v`; `none` to always use `paste_keys`). The focused app is known on KDE Plasma via a small KWin script. |
+| `[behavior] terminal_apps` | Window classes treated as terminals; defaults cover Konsole, kitty, Alacritty, foot, WezTerm, Ghostty, GNOME Terminal and more. |
 | `[vad] threshold`, `min_speech_ms` | Raise them if breaths or keyboard noise get transcribed. |
 
 ## Development
@@ -109,6 +111,7 @@ runtime and cuBLAS, which transcribe-cpp-sys 0.4.0's link manifest leaves out.
 | `src/hotkey.rs` | evdev keyboard watching, including hot-plugged devices |
 | `src/recorder.rs` | `arecord` capture into memory |
 | `src/output.rs` | Clipboard, auto-paste, notifications |
+| `src/window.rs` | The focused window's class from KWin, for terminal paste |
 | `src/tray.rs` | The StatusNotifierItem tray icon and menu |
 
 ## History

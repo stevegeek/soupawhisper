@@ -139,6 +139,10 @@ pub struct Config {
     pub notifications: bool,
     pub audio_device: String,
     pub paste_keys: Vec<String>,
+    /// Paste shortcut for terminals (None: use paste_keys everywhere).
+    pub terminal_paste_keys: Option<Vec<String>>,
+    /// Window classes (lowercase) that get terminal_paste_keys.
+    pub terminal_apps: Vec<String>,
     pub record_mode: RecordMode,
     pub long_press: f64,
     pub vad_threshold: f32,
@@ -267,6 +271,17 @@ impl Config {
             notifications: ini.bool("behavior", "notifications", true),
             audio_device: ini.str("audio", "device", "default"),
             paste_keys: parse_paste_keys(&ini.str("behavior", "paste_keys", "ctrl+v")),
+            terminal_paste_keys: match ini.str("behavior", "terminal_paste_keys", "ctrl+shift+v").trim() {
+                "" | "none" => None,
+                keys => Some(parse_paste_keys(keys)),
+            },
+            terminal_apps: ini
+                .get("behavior", "terminal_apps")
+                .unwrap_or(DEFAULT_TERMINALS)
+                .split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect(),
             record_mode,
             long_press: ini.num("behavior", "long_press", 0.4),
             vad_threshold: ini.num("vad", "threshold", 0.5),
@@ -285,6 +300,12 @@ impl Config {
         fs::write(path, format!("[engine]\nengine = {engine}\ndevice = {device}\n\n"))
     }
 }
+
+/// Window classes of common terminals, which paste with Ctrl+Shift+V.
+const DEFAULT_TERMINALS: &str = "org.kde.konsole, konsole, org.kde.yakuake, yakuake, kitty, alacritty, \
+    org.alacritty.alacritty, foot, footclient, org.wezfurlong.wezterm, wezterm, com.mitchellh.ghostty, ghostty, \
+    gnome-terminal-server, org.gnome.terminal, org.gnome.ptyxis, xfce4-terminal, terminator, tilix, \
+    xterm, urxvt, st";
 
 pub fn key_code(name: &str) -> Option<KeyCode> {
     let name = name.to_lowercase();
@@ -415,6 +436,8 @@ mod tests {
         assert_eq!(cfg.keywords, ["Rails", "Sidekiq"]);
         assert_eq!(cfg.granite_model, "ibm-granite/granite-speech-4.1-2b");
         assert_eq!(cfg.quant, "Q8_0");
+        assert_eq!(cfg.terminal_paste_keys.as_deref(), Some(&parse_paste_keys("ctrl+shift+v")[..]));
+        assert!(cfg.terminal_apps.contains(&"org.kde.konsole".to_string()));
         assert_eq!(cfg.language, Language::OneOf(vec!["en".into(), "it".into(), "el".into()]));
 
         let whisper_cpu = Choice { engine: EngineKind::Whisper, device: Device::Cpu };

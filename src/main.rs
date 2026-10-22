@@ -7,6 +7,7 @@ mod hotkey;
 mod output;
 mod recorder;
 mod tray;
+mod window;
 
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;

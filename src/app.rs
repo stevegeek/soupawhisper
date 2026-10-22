@@ -11,6 +11,7 @@ use crate::engine::Engine;
 use crate::output::{self, Notifier};
 use crate::recorder::Recording;
 use crate::tray::{self, Status, TrayHandle};
+use crate::window::{self, ActiveWindow};
 
 pub enum Event {
     KeyDown(PathBuf),
@@ -137,6 +138,8 @@ pub struct App {
     keys: Keys,
     notifier: Notifier,
     tray: Option<TrayHandle>,
+    /// The focused app, when the desktop can tell us (KDE Plasma).
+    active_window: Option<ActiveWindow>,
     /// The engine wanted; the loaded one may differ until a switch completes.
     choice: Choice,
     engine: Option<Engine>,
@@ -151,7 +154,17 @@ pub struct App {
 impl App {
     pub fn new(cfg: Config, tx: Sender<Event>) -> App {
         let tray = tray::spawn(&cfg, tx.clone());
+        let active_window = match &cfg.terminal_paste_keys {
+            Some(_) if cfg.auto_type && output::is_wayland() => {
+                let dir = crate::engine::models_dir().parent().unwrap().to_path_buf();
+                window::watch(&dir)
+                    .inspect_err(|e| info!("Focused window unknown ({e:#}); pasting with paste_keys everywhere"))
+                    .ok()
+            }
+            _ => None,
+        };
         App {
+            active_window,
             keys: Keys::new(cfg.record_mode, cfg.long_press),
             notifier: Notifier::new(cfg.notifications),
             choice: cfg.choice,
@@ -311,7 +324,7 @@ impl App {
                     error!("Clipboard failed: {e:#}");
                 }
                 if self.cfg.auto_type {
-                    output::auto_type(&text, &self.cfg.paste_keys);
+                    output::auto_type(&text, self.paste_keys());
                 }
                 let body: String = text.chars().take(100).collect();
                 let more = if text.chars().count() > 100 { "..." } else { "" };
@@ -328,6 +341,18 @@ impl App {
             }
         }
         self.set_tray(self.idle_status());
+    }
+
+    /// The paste shortcut for the focused app: terminals have their own.
+    fn paste_keys(&self) -> &[String] {
+        let class = self.active_window.as_ref().and_then(ActiveWindow::class);
+        match (&self.cfg.terminal_paste_keys, class) {
+            (Some(keys), Some(class)) if window::is_terminal(&class, &self.cfg.terminal_apps) => {
+                debug!("Pasting into terminal {class}");
+                keys
+            }
+            _ => &self.cfg.paste_keys,
+        }
     }
 
     fn act(&mut self, action: Action) {
