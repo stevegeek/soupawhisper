@@ -37,6 +37,8 @@ pub struct DictationTray {
     pub recording_since: Option<Instant>,
     hotkey: String,
     config_path: String,
+    /// Where our own icons were written (empty if that failed).
+    icon_dir: String,
     tx: Sender<Event>,
 }
 
@@ -71,19 +73,23 @@ impl Tray for DictationTray {
         ksni::Category::ApplicationStatus
     }
 
+    fn icon_theme_path(&self) -> String {
+        self.icon_dir.clone()
+    }
+
     fn icon_name(&self) -> String {
-        match self.status {
-            Status::Loading => "content-loading-symbolic",
-            Status::Ready | Status::Unloaded => "audio-input-microphone",
-            Status::Recording => "media-record",
-            Status::Processing => "system-run",
-            Status::Error => "dialog-error",
-        }
-        .into()
+        let name = match self.status {
+            Status::Loading => "loading",
+            Status::Ready | Status::Unloaded => "ready",
+            Status::Recording => "recording",
+            Status::Processing => "processing",
+            Status::Error => "error",
+        };
+        format!("soupawhisper-{name}")
     }
 
     fn attention_icon_name(&self) -> String {
-        "media-record".into()
+        "soupawhisper-recording".into()
     }
 
     fn status(&self) -> ksni::Status {
@@ -172,8 +178,40 @@ impl Tray for DictationTray {
     }
 }
 
+/// Full-colour icons that read on light and dark panels alike; theme icons are
+/// monochrome and get recoloured for the colour scheme, not the panel.
+const ICONS: [(&str, &str); 5] = [
+    ("ready", include_str!("../assets/icons/soupawhisper-ready.svg")),
+    ("recording", include_str!("../assets/icons/soupawhisper-recording.svg")),
+    ("processing", include_str!("../assets/icons/soupawhisper-processing.svg")),
+    ("loading", include_str!("../assets/icons/soupawhisper-loading.svg")),
+    ("error", include_str!("../assets/icons/soupawhisper-error.svg")),
+];
+
+/// Write the icons where the tray host can find them: directly in the directory and
+/// in a hicolor layout, since hosts differ in how they search IconThemePath.
+fn install_icons() -> std::io::Result<String> {
+    let dir = crate::engine::models_dir().parent().unwrap().join("icons");
+    let hicolor = dir.join("hicolor/scalable/apps");
+    std::fs::create_dir_all(&hicolor)?;
+    for (state, svg) in ICONS {
+        let file = format!("soupawhisper-{state}.svg");
+        for target in [dir.join(&file), hicolor.join(&file)] {
+            if std::fs::read_to_string(&target).ok().as_deref() != Some(svg) {
+                std::fs::write(target, svg)?;
+            }
+        }
+    }
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 pub fn spawn(cfg: &Config, tx: Sender<Event>) -> Option<TrayHandle> {
+    let icon_dir = install_icons().unwrap_or_else(|e| {
+        warn!("Could not write tray icons: {e}");
+        String::new()
+    });
     let tray = DictationTray {
+        icon_dir,
         status: Status::Loading,
         choice: cfg.choice,
         recording_since: None,
