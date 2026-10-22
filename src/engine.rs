@@ -8,8 +8,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use transcribe_cpp::{
-    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, SessionOptions, VadOptions,
-    VadSession, VadSessionOptions, WhisperRunOptions,
+    Backend, Feature, Model, ModelOptions, RunExtension, RunOptions, Session, SessionOptions, Transcript,
+    VadOptions, VadSession, VadSessionOptions, WhisperRunOptions,
 };
 
 use crate::config::{Choice, Config, Device, EngineKind, Language};
@@ -20,8 +20,10 @@ const VAD_URL: &str = "https://huggingface.co/ggml-org/whisper-vad/resolve/main"
 const MODEL_URL: &str = "https://huggingface.co/handy-computer";
 /// Silence put back between speech segments so words don't run together.
 const GAP_SECONDS: f32 = 0.2;
-/// Granite takes at most ~6 minutes per call; stay well under it.
-const MAX_CHUNK_SECONDS: usize = 300;
+/// Granite has no long-form support: past ~30 s per call it starts repeating itself.
+const GRANITE_CHUNK_SECONDS: usize = 30;
+/// Whisper handles long audio in 30 s windows itself.
+const WHISPER_CHUNK_SECONDS: usize = 300;
 
 pub fn models_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -164,12 +166,33 @@ impl Engine {
     /// Only the speech, split into chunks the model accepts, with short gaps between
     /// segments. Empty if there is none.
     fn speech_chunks(&mut self, audio: &[f32]) -> Result<Vec<Vec<f32>>> {
+        let max_seconds = match self.choice.engine {
+            EngineKind::Granite => GRANITE_CHUNK_SECONDS,
+            EngineKind::Whisper => WHISPER_CHUNK_SECONDS,
+        };
         let mut options = VadOptions::default();
         options.threshold = self.vad_threshold as f64;
         options.min_speech_ms = self.vad_min_speech_ms;
+        // Split long stretches of speech too, a little under the limit to leave room for padding
+        options.max_speech_ms = (max_seconds * 1000 - 1000) as i32;
         let segments = self.vad.run(audio, &options)?.segments;
         let pieces = segments.iter().map(|s| (s.start_sample.max(0) as usize, (s.end_sample.max(0) as usize).min(audio.len())));
-        Ok(join_speech(audio, pieces, MAX_CHUNK_SECONDS * SAMPLE_RATE))
+        Ok(join_speech(audio, pieces, max_seconds * SAMPLE_RATE))
+    }
+
+    /// One model call. When the model repeats itself or runs out of room, keep what it
+    /// produced rather than losing the whole chunk.
+    fn run_once(&mut self, chunk: &[f32], options: &RunOptions) -> Result<Transcript> {
+        match self.session.run(chunk, options) {
+            Ok(transcript) => Ok(transcript),
+            Err(e) => match e.partial() {
+                Some(partial) if !partial.text.trim().is_empty() => {
+                    warn!("Keeping a partial transcript: {e}");
+                    Ok(partial.clone())
+                }
+                _ => Err(e.into()),
+            },
+        }
     }
 
     fn run_options(&self, language: Option<String>) -> RunOptions {
@@ -205,7 +228,7 @@ impl Engine {
 
     fn run(&mut self, chunk: &[f32]) -> Result<String> {
         let hint = self.language_hint();
-        let transcript = self.session.run(chunk, &self.run_options(hint.clone()))?;
+        let transcript = self.run_once(chunk, &self.run_options(hint.clone()))?;
         // Detected a language outside the allowed set: redo it in the first allowed one
         if let (None, Language::OneOf(allowed)) = (&hint, &self.language) {
             if let Some(detected) = &transcript.language {
@@ -213,7 +236,7 @@ impl Engine {
                 if !allowed.contains(detected) && self.supports_language(&allowed[0]) {
                     info!("Detected '{detected}' not in allowed {allowed:?}, using '{}'", allowed[0]);
                     let retry = self.run_options(Some(allowed[0].clone()));
-                    return Ok(self.session.run(chunk, &retry)?.text.trim().to_string());
+                    return Ok(self.run_once(chunk, &retry)?.text.trim().to_string());
                 }
             }
         }
@@ -269,6 +292,29 @@ pub fn join_speech(audio: &[f32], pieces: impl Iterator<Item = (usize, usize)>, 
         }
     }
     chunks
+}
+
+/// Write 16 kHz mono 16-bit WAV, the format read_wav and --transcribe take.
+pub fn write_wav(path: &Path, samples: &[f32]) -> Result<()> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&[1, 0, 1, 0]); // PCM, mono
+    wav.extend_from_slice(&(SAMPLE_RATE as u32).to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes());
+    wav.extend_from_slice(&[2, 0, 16, 0]);
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        wav.extend_from_slice(&((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, wav).with_context(|| format!("writing {}", path.display()))
 }
 
 /// 16-bit little-endian mono PCM → f32 samples in [-1, 1).
@@ -346,6 +392,15 @@ mod tests {
         assert!(join_speech(&audio, std::iter::empty(), 30_000).is_empty());
         let short = join_speech(&audio, [(0, 100)].into_iter(), 30_000);
         assert_eq!(short[0].len(), SAMPLE_RATE, "padded to a second");
+    }
+
+    #[test]
+    fn written_wav_reads_back() {
+        let path = std::env::temp_dir().join(format!("sw-write-{}.wav", std::process::id()));
+        write_wav(&path, &[0.0, 0.5, -0.5]).unwrap();
+        let back = read_wav(&path).unwrap();
+        assert!(back.iter().zip([0.0, 0.5, -0.5]).all(|(a, b)| (a - b).abs() < 1e-3));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

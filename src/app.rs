@@ -7,11 +7,19 @@ use std::time::{Duration, Instant};
 use log::{debug, error, info, warn};
 
 use crate::config::{Choice, Config, Device, EngineKind, RecordMode};
-use crate::engine::Engine;
+use crate::engine::{self, Engine};
 use crate::output::{self, Notifier};
 use crate::recorder::Recording;
 use crate::tray::{self, Status, TrayHandle};
 use crate::window::{self, ActiveWindow};
+
+/// Where the latest recording is kept until the next one.
+pub fn last_recording_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::config::home().join(".cache"));
+    base.join("soupawhisper/last-recording.wav")
+}
 
 pub enum Event {
     KeyDown(PathBuf),
@@ -294,6 +302,10 @@ impl App {
         let Some((recording, _)) = self.recording.take() else { return };
         let audio = recording.stop();
         info!("Recording stopped ({:.1}s), transcribing...", audio.len() as f32 / 16000.0);
+        // Keep it on disk so a failed transcription never loses what was said
+        if let Err(e) = engine::write_wav(&last_recording_path(), &audio) {
+            warn!("Could not save the recording: {e:#}");
+        }
         if self.engine.is_some() {
             self.transcribe(audio);
         } else if self.loading {
@@ -336,8 +348,15 @@ impl App {
             }
             Err(e) => {
                 error!("Transcription error: {e:#}");
-                let short: String = format!("{e}").chars().take(50).collect();
-                self.notifier.notify("Error", &short, "dialog-error", 3000);
+                let path = last_recording_path();
+                error!("The recording is saved; retry with: soupawhisper --transcribe {}", path.display());
+                let short: String = format!("{e}").chars().take(60).collect();
+                self.notifier.notify(
+                    "Transcription failed",
+                    &format!("{short}\nRecording saved to {}", path.display()),
+                    "dialog-error",
+                    10000,
+                );
             }
         }
         self.set_tray(self.idle_status());
